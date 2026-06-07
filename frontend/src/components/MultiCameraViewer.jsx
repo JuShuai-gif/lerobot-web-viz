@@ -1,10 +1,14 @@
+import { useMemo } from 'react';
 import FrameViewer from './FrameViewer.jsx';
 
 export default function MultiCameraViewer({ cameraKeys, frameId, getSrc, videoSegments, videoRefs, onVideoReady, onVideoWaiting }) {
-  const segmentByCamera = new Map((videoSegments || []).map((segment) => [segment.camera, segment]));
+  const segmentByCamera = useMemo(
+    () => new Map((videoSegments || []).map((segment) => [segment.camera, segment])),
+    [videoSegments]
+  );
 
   return (
-    <section className="viewer-grid" style={{ '--camera-count': Math.max(1, cameraKeys.length) }}>
+    <section className="viewer-grid">
       {cameraKeys.map((camera) => {
         const segment = segmentByCamera.get(camera);
         if (!segment) {
@@ -22,7 +26,7 @@ export default function MultiCameraViewer({ cameraKeys, frameId, getSrc, videoSe
               muted
               playsInline
               preload="auto"
-              onCanPlay={() => onVideoReady(camera)}
+              onCanPlayThrough={() => onVideoReady(camera)}
               onWaiting={() => onVideoWaiting && onVideoWaiting(camera)}
               onStalled={() => onVideoWaiting && onVideoWaiting(camera)}
             />

@@ -110,11 +110,13 @@ class LeRobotDatasetLoader:
         self._pq_dataset = None
         self._pq_columns: list[str] | None = None
         self._series_cache_dir: Path | None = None
+        self._cached_jump_threshold: float | None = None
         self.camera_keys = self._discover_camera_keys()
         self.episode_ranges = self._discover_episode_ranges()
         self.frame_cache = LRUFrameCache(settings.frame_cache_size)
         self._decode_locks: dict[tuple[int, int, int], RLock] = {}
         self._decode_locks_guard = RLock()
+        self._cached_jump_threshold: float | None = None
 
     def _load_metadata(self) -> Any:
         try:
@@ -926,13 +928,17 @@ class LeRobotDatasetLoader:
                 jumps = np.linalg.norm(np.diff(action_arr, axis=0), axis=1)
                 median = float(np.median(jumps))
                 mad = float(np.median(np.abs(jumps - median))) or 1e-9
+                threshold = (
+                    self._cached_jump_threshold or self.settings.action_jump_zscore
+                )
                 for idx, jump in enumerate(jumps):
-                    if (jump - median) / mad > self.settings.action_jump_zscore:
+                    z = (jump - median) / mad
+                    if z > threshold:
                         warnings.append(
                             WarningItem(
                                 type="action_jump",
                                 level="warning",
-                                message=f"Frame {idx + 1} has an abnormal action jump.",
+                                message=f"帧 {idx} → {idx + 1} 动作跳变 (z={z:.1f})",
                             )
                         )
                         break
@@ -945,18 +951,20 @@ class LeRobotDatasetLoader:
                     if mins and maxs:
                         global_min = np.asarray(mins, dtype=np.float64)
                         global_max = np.asarray(maxs, dtype=np.float64)
+                        global_range = global_max - global_min
                         ep_min = action_arr.min(axis=0)
                         ep_max = action_arr.max(axis=0)
-                        range_ratio = (ep_max - ep_min) / np.maximum(
-                            global_max - global_min, 1e-9
-                        )
-                        for dim in range(len(range_ratio)):
-                            if range_ratio[dim] < 0.01:
+                        ep_range = ep_max - ep_min
+                        for dim in range(len(ep_range)):
+                            if global_range[dim] < 0.002:
+                                continue  # Skip joints with negligible global range (grippers, fixed)
+                            ratio = ep_range[dim] / max(global_range[dim], 1e-9)
+                            if ratio < 0.10:
                                 warnings.append(
                                     WarningItem(
-                                        type="action_dim_stuck",
+                                        type="action_dim_low",
                                         level="info",
-                                        message=f"Action dim {dim} range is too small ({range_ratio[dim]:.4f}x of global), joint may be stuck.",
+                                        message=f"Dim {dim} range is {ratio:.0%} of global ({ep_range[dim]:.4f} vs {global_range[dim]:.4f}), may be inactive.",
                                     )
                                 )
                                 break
@@ -993,6 +1001,213 @@ class LeRobotDatasetLoader:
         timestamps = self.series(episode_id, "timestamps")
         actions = self.series(episode_id, "actions")
         return self._compute_warnings(episode_id, detail, timestamps, actions)
+
+    def analyze(self) -> dict:
+        """Full dataset analysis across all episodes."""
+        cache_key = f"analysis_{self.root.name}_{hash(str(self.root))}"
+        cached = self._get_series_from_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        episodes = self.episodes()
+        fps_nominal = getattr(self.meta, "fps", None)
+        total_frames = 0
+        total_duration = 0.0
+
+        action_jumps = []
+        fps_deviations = []
+        frame_gaps = []
+        issues = []
+        all_fps_values = []
+        all_per_episode_zscores = []  # (ep_id, zscores_list, median, mad)
+
+        # Per-dimension global range for joint activity analysis
+        stats = self._data_stats(ACTION_KEYS)
+        global_min = []
+        global_max = []
+        joint_names = self._feature_names(ACTION_KEYS) or []
+        if stats:
+            global_min = stats.get("min", [])
+            global_max = stats.get("max", [])
+
+        for ep in episodes:
+            ts = self.series(ep.id, "timestamps")
+            actions = self.series(ep.id, "actions")
+            total_frames += ep.frame_count
+
+            # --- Duration ---
+            ts_clean = [x for x in ts if x is not None]
+            if len(ts_clean) >= 2:
+                dur = ts_clean[-1] - ts_clean[0]
+                total_duration += dur
+
+            # --- FPS stability ---
+            if len(ts_clean) >= 3 and fps_nominal:
+                diffs = np.diff(np.asarray(ts_clean, dtype=np.float64))
+                positive = diffs[diffs > 0]
+                if len(positive) > 0:
+                    actual_fps = float(1.0 / np.median(positive))
+                    all_fps_values.append(actual_fps)
+                    ratio = actual_fps / float(fps_nominal)
+                    if ratio < 0.8 or ratio > 1.3:
+                        fps_deviations.append(
+                            {
+                                "episode": ep.id,
+                                "nominal": fps_nominal,
+                                "actual": round(actual_fps, 1),
+                                "ratio": round(ratio, 2),
+                            }
+                        )
+
+            # --- Action jumps: collect per-episode zscores ---
+            act_clean = [a for a in actions if a is not None]
+            if len(act_clean) > 3:
+                action_arr = np.asarray(act_clean, dtype=np.float64)
+                if action_arr.ndim == 2:
+                    jumps = np.linalg.norm(np.diff(action_arr, axis=0), axis=1)
+                    ep_median = float(np.median(jumps))
+                    ep_mad = float(np.median(np.abs(jumps - ep_median))) or 1e-9
+                    ep_zscores = ((jumps - ep_median) / ep_mad).tolist()
+                    all_per_episode_zscores.append(
+                        (ep.id, ep_zscores, ep_median, ep_mad)
+                    )
+
+            # --- Frame index continuity ---
+            try:
+                fi_data = self._parquet_batch_columns(ep.id, ["frame_index"])
+                if "frame_index" in fi_data:
+                    fi_vals = fi_data["frame_index"]
+                    for i in range(1, len(fi_vals)):
+                        prev = fi_vals[i - 1]
+                        curr = fi_vals[i]
+                        if isinstance(prev, (int, float)) and isinstance(
+                            curr, (int, float)
+                        ):
+                            gap = int(curr) - int(prev) - 1
+                            if gap > 0:
+                                frame_gaps.append(
+                                    {
+                                        "episode": ep.id,
+                                        "position": i,
+                                        "gap": gap,
+                                    }
+                                )
+                                break
+            except Exception:
+                pass
+
+        # --- Adaptive action jump threshold ---
+        adaptive_threshold = None
+        if all_per_episode_zscores:
+            all_zs = np.concatenate([zs for _, zs, _, _ in all_per_episode_zscores])
+            all_zs = all_zs[all_zs > 0]  # Only consider positive zscores (upward jumps)
+            if len(all_zs) > 0:
+                z_median = float(np.median(all_zs))
+                z_mad = float(np.median(np.abs(all_zs - z_median))) or 1e-9
+                # Threshold = max(99.7 percentile, median + 8 * MAD) of zscore distribution
+                p99_7 = float(np.percentile(all_zs, 99.7))
+                mad_threshold = z_median + 8.0 * z_mad
+                adaptive_threshold = max(
+                    p99_7, mad_threshold, self.settings.action_jump_zscore
+                )
+                self._cached_jump_threshold = adaptive_threshold
+                # Apply threshold to detect jumps
+                for ep_id, zscores, ep_median, ep_mad in all_per_episode_zscores:
+                    for idx, z in enumerate(zscores):
+                        if z > adaptive_threshold:
+                            action_jumps.append(
+                                {
+                                    "episode": ep_id,
+                                    "from_frame": idx,
+                                    "to_frame": idx + 1,
+                                    "zscore": round(float(z), 1),
+                                }
+                            )
+
+        # --- Joint activity (per-episode aggregate) ---
+        active_joints = set()
+        inactive_joints = []
+        if global_min and global_max:
+            seen_inactive = set()
+            for dim in range(len(global_min)):
+                r = global_max[dim] - global_min[dim]
+                name = joint_names[dim] if dim < len(joint_names) else f"dim{dim}"
+                parts = name.split("_")
+                if parts[0] in ("left", "right"):
+                    short = parts[0][0].upper() + "_" + parts[-1]
+                else:
+                    short = parts[-1]
+                if r >= 0.002:
+                    active_joints.add(short)
+                elif short not in seen_inactive:
+                    seen_inactive.add(short)
+                    inactive_joints.append(short)
+
+        # --- Summary ---
+        actual_fps_median = float(np.median(all_fps_values)) if all_fps_values else None
+        summaries = []
+
+        summaries.append(
+            f"共 {len(episodes)} 个 episode，{total_frames} 帧，录制时长 {total_duration:.1f}s"
+        )
+        if fps_nominal:
+            summaries.append(
+                f"标称 FPS: {fps_nominal:.0f}"
+                + (
+                    f"，实际中位数 FPS: {actual_fps_median:.1f}"
+                    if actual_fps_median
+                    else ""
+                )
+            )
+
+        if active_joints:
+            summaries.append(f"活跃关节: {', '.join(sorted(active_joints))}")
+        if inactive_joints:
+            summaries.append(
+                f"基本不动: {', '.join(inactive_joints)}（全局范围 < 0.002，可能是 gripper 或录制时未操作）"
+            )
+
+        if action_jumps and adaptive_threshold is not None:
+            summaries.append(
+                f"动作跳变: 共 {len(action_jumps)} 处（阈值 z>{adaptive_threshold:.1f}），分布在 {len(set(j['episode'] for j in action_jumps))} 个 episode"
+            )
+        elif action_jumps:
+            summaries.append(
+                f"动作跳变: 共 {len(action_jumps)} 处，分布在 {len(set(j['episode'] for j in action_jumps))} 个 episode"
+            )
+        if fps_deviations:
+            summaries.append(f"帧率异常: 共 {len(fps_deviations)} 个 episode")
+        if frame_gaps:
+            summaries.append(f"帧索引缺失: 共 {len(frame_gaps)} 个 episode")
+
+        issue_episodes = (
+            set(j["episode"] for j in action_jumps)
+            | set(d["episode"] for d in fps_deviations)
+            | set(g["episode"] for g in frame_gaps)
+        )
+        clean_count = len(episodes) - len(issue_episodes)
+        if issue_episodes:
+            summaries.append(
+                f"有异常的 episode: {sorted(issue_episodes)}，无异常的: {clean_count} 个"
+            )
+        else:
+            summaries.append("所有 episode 均无明显异常")
+
+        result = {
+            "total_episodes": len(episodes),
+            "total_frames": total_frames,
+            "total_duration": round(total_duration, 1),
+            "nominal_fps": fps_nominal,
+            "actual_fps": round(actual_fps_median, 1) if actual_fps_median else None,
+            "active_joints": active_joints,
+            "inactive_joints": inactive_joints,
+            "action_jumps": action_jumps,
+            "fps_deviations": fps_deviations,
+            "frame_gaps": frame_gaps,
+            "summary": "\n".join(summaries),
+        }
+        self._save_series_to_cache(cache_key, result)
+        return result
 
 
 @lru_cache

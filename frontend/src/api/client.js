@@ -90,6 +90,10 @@ export function getEpisodeVideos(episodeId) {
   return requestJson(`/api/episodes/${episodeId}/videos`);
 }
 
+export function getAnalysis() {
+  return requestJson('/api/dataset/analysis');
+}
+
 export function getFeatureSeries(episodeId, featureKey) {
   return requestJson(`/api/episodes/${episodeId}/feature/${encodeURIComponent(featureKey)}`);
 }

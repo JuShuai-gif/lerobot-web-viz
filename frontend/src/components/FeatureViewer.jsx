@@ -15,6 +15,7 @@ export default function FeatureViewer({ episodeId, featureKeys, frameId, onSelec
       return;
     }
     setLoading(true);
+    setValues([]);
     getFeatureSeries(episodeId, key)
       .then((data) => setValues(data.values || []))
       .catch(() => setValues([]))
@@ -36,7 +37,7 @@ export default function FeatureViewer({ episodeId, featureKeys, frameId, onSelec
             <option key={key} value={key}>{key}</option>
           ))}
         </select>
-        {loading && <span className="loading-hint">loading...</span>}
+        {loading && <span className="loading-hint">loading</span>}
       </div>
       {selectedFeature && values.length > 0 && (
         <SeriesChart

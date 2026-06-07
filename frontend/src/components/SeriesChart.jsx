@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 
 function numericValues(values, dim) {
@@ -25,7 +26,7 @@ function toRows(values, dim) {
   }));
 }
 
-export default function SeriesChart({ title, values, currentFrame, selectedDim, onDimChange, onSelectFrame, color, dimNames }) {
+const SeriesChart = memo(function SeriesChart({ title, values, currentFrame, selectedDim, onDimChange, onSelectFrame, color, dimNames }) {
   const dims = values?.find((item) => Array.isArray(item))?.length || 0;
   const safeDim = Math.min(Math.max(0, selectedDim || 0), Math.max(0, dims - 1));
   const rows = toRows(values, safeDim);
@@ -40,13 +41,15 @@ export default function SeriesChart({ title, values, currentFrame, selectedDim, 
     <div className="chart-panel">
       <div className="chart-header">
         <div className="panel-title">{title}</div>
-        <select value={safeDim} onChange={(event) => onDimChange(Number(event.target.value))} disabled={dims === 0}>
-          {Array.from({ length: Math.max(1, dims) }).map((_, index) => (
-            <option key={index} value={index}>{dims === 0 ? 'none' : dimLabel(index)}</option>
-          ))}
-        </select>
+        {dims > 1 && (
+          <select value={safeDim} onChange={(event) => onDimChange(Number(event.target.value))}>
+            {Array.from({ length: dims }).map((_, index) => (
+              <option key={index} value={index}>{dimLabel(index)}</option>
+            ))}
+          </select>
+        )}
       </div>
-      <ResponsiveContainer width="100%" height={170}>
+      <ResponsiveContainer width="100%" height={260}>
         <LineChart data={rows} onClick={(event) => event?.activeLabel != null && onSelectFrame(Number(event.activeLabel))}>
           <XAxis dataKey="frame" type="number" domain={[0, Math.max(0, rows.length - 1)]} tick={{ fontSize: 11 }} />
           <YAxis tick={{ fontSize: 11 }} width={42} />
@@ -69,4 +72,6 @@ export default function SeriesChart({ title, values, currentFrame, selectedDim, 
       </div>
     </div>
   );
-}
+});
+
+export default SeriesChart;

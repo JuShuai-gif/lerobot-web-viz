@@ -1,16 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getEpisode, getEpisodeVideos, getEpisodes, getFeatureSeries, getFrameUrl, getTrajectories, loadDataset, nativePickFolder } from './api/client.js';
-import ActionChart from './components/ActionChart.jsx';
+import TrajectoryChart from './components/TrajectoryChart.jsx';
 import DatasetInfoPanel from './components/DatasetInfoPanel.jsx';
 import EpisodeList from './components/EpisodeList.jsx';
 import FeatureViewer from './components/FeatureViewer.jsx';
 import MultiCameraViewer from './components/MultiCameraViewer.jsx';
 import PlayerControls from './components/PlayerControls.jsx';
-import StateChart from './components/StateChart.jsx';
 import Timeline from './components/Timeline.jsx';
 
 const PRELOAD_AHEAD = 8;
 const MAX_IMAGE_CACHE = 240;
+const MAX_PRELOAD_CONCURRENT = 4;
 const JPEG_QUALITY = 75;
 const SYNC_TOLERANCE_SECONDS = 0.08;
 
@@ -32,14 +32,14 @@ export default function App() {
   const [timestamps, setTimestamps] = useState([]);
   const [warnings, setWarnings] = useState([]);
   const [videoSegments, setVideoSegments] = useState([]);
-  const [actionDim, setActionDim] = useState(0);
-  const [stateDim, setStateDim] = useState(0);
   const [loadingTrajectories, setLoadingTrajectories] = useState(false);
+  const [trajectoriesLoaded, setTrajectoriesLoaded] = useState(false);
   const [taskIndices, setTaskIndices] = useState([]);
   const [error, setError] = useState('');
   const [datasetPathInput, setDatasetPathInput] = useState('');
   const [repoIdInput, setRepoIdInput] = useState('');
   const [loadingDataset, setLoadingDataset] = useState(false);
+  const [episodeLoading, setEpisodeLoading] = useState(false);
   const rafRef = useRef(null);
   const lastTickRef = useRef(0);
   const imageCacheRef = useRef(new Map());
@@ -47,6 +47,9 @@ export default function App() {
   const [videoReadyMap, setVideoReadyMap] = useState({});
   const [videoStalled, setVideoStalled] = useState(false);
   const frameIdRef = useRef(0);
+  const preloadQueueRef = useRef([]);
+  const preloadActiveRef = useRef(0);
+  const pendingNavigateRef = useRef(null);
 
   useEffect(() => {
     frameIdRef.current = frameId;
@@ -167,6 +170,7 @@ export default function App() {
     setVideoSegments([]);
     setVideoReadyMap({});
     setVideoStalled(false);
+    setTrajectoriesLoaded(false);
     videoRefs.current = {};
     imageCacheRef.current.clear();
     loadDataset(datasetPathInput.trim(), repoIdInput.trim())
@@ -190,6 +194,23 @@ export default function App() {
       .catch((exc) => setError(exc.message));
   }, []);
 
+  const navigateToFrame = useCallback((episodeId, frameIndex) => {
+    if (episodeId == null) return;
+    pendingNavigateRef.current = { episodeId, frameIndex };
+    setSelectedEpisodeId(episodeId);
+  }, []);
+
+  // Execute pending navigation once episode data is loaded
+  useEffect(() => {
+    if (!episode || !pendingNavigateRef.current) return;
+    if (episode.id !== pendingNavigateRef.current.episodeId) return;
+    const target = pendingNavigateRef.current.frameIndex;
+    pendingNavigateRef.current = null;
+    const clamped = Math.max(0, Math.min(episode.frame_count - 1, target));
+    setFrameId(clamped);
+    seekVideosToRelativeTime(frameToRelativeTime(clamped));
+  }, [episode, frameToRelativeTime, seekVideosToRelativeTime]);
+
   const loadEpisodeTrajectories = useCallback((episodeId = selectedEpisodeId) => {
     if (episodeId == null) return;
     setLoadingTrajectories(true);
@@ -205,6 +226,7 @@ export default function App() {
           setWarnings(trajData.warnings || []);
         }
         setTaskIndices(taskData.values || []);
+        setTrajectoriesLoaded(true);
       })
       .catch((exc) => setError(exc.message))
       .finally(() => setLoadingTrajectories(false));
@@ -221,10 +243,12 @@ export default function App() {
     setStates([]);
     setTimestamps([]);
     setTaskIndices([]);
+    setTrajectoriesLoaded(false);
     setWarnings([]);
     setVideoSegments([]);
     setVideoReadyMap({});
     setVideoStalled(false);
+    setEpisodeLoading(true);
     videoRefs.current = {};
     imageCacheRef.current.clear();
 
@@ -234,6 +258,9 @@ export default function App() {
         setEpisode(episodeData);
         setFps(Math.round(episodeData.fps || datasetInfo?.fps || 30));
         setError('');
+        setEpisodeLoading(false);
+        // Auto-load trajectories
+        loadEpisodeTrajectories(selectedEpisodeId);
       })
       .catch((exc) => !cancelled && setError(exc.message));
 
@@ -244,41 +271,46 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selectedEpisodeId, datasetInfo?.fps, pauseVideos]);
 
-  const getSrc = useCallback((cameraName, targetFrame = frameId) => {
+  const getSrc = useCallback((cameraName, targetFrame) => {
     if (selectedEpisodeId == null) return '';
-    return getFrameUrl(selectedEpisodeId, targetFrame, cameraName, JPEG_QUALITY);
-  }, [frameId, selectedEpisodeId]);
+    const frame = targetFrame != null ? targetFrame : frameIdRef.current;
+    return getFrameUrl(selectedEpisodeId, frame, cameraName, JPEG_QUALITY);
+  }, [selectedEpisodeId]);
+
+  const processPreloadQueue = useCallback(() => {
+    while (preloadActiveRef.current < MAX_PRELOAD_CONCURRENT && preloadQueueRef.current.length > 0) {
+      const { targetFrame, cameraName } = preloadQueueRef.current.shift();
+      preloadActiveRef.current += 1;
+      const url = getFrameUrl(selectedEpisodeId, targetFrame, cameraName, JPEG_QUALITY);
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = img.onerror = () => {
+        preloadActiveRef.current -= 1;
+        processPreloadQueue();
+      };
+      img.src = url;
+      imageCacheRef.current.set(url, img);
+    }
+  }, [selectedEpisodeId]);
 
   const preloadFrame = useCallback((targetFrame) => {
     if (hasNativeVideos || selectedEpisodeId == null || !episode) return;
     for (const cameraName of cameraKeys) {
       const url = getFrameUrl(selectedEpisodeId, targetFrame, cameraName, JPEG_QUALITY);
       if (imageCacheRef.current.has(url)) continue;
-      const image = new Image();
-      image.decoding = 'async';
-      image.src = url;
-      imageCacheRef.current.set(url, image);
       while (imageCacheRef.current.size > MAX_IMAGE_CACHE) {
         const oldest = imageCacheRef.current.keys().next().value;
         imageCacheRef.current.delete(oldest);
       }
+      preloadQueueRef.current.push({ targetFrame, cameraName });
+      processPreloadQueue();
     }
-  }, [cameraKeys, episode, hasNativeVideos, selectedEpisodeId]);
-
-  useEffect(() => {
-    if (!hasNativeVideos || videoSegments.length === 0) return;
-    if (allVideosReady) {
-      setWarnings((prev) => prev.filter((w) => w.type !== 'video_loading'));
-      return;
-    }
-    setWarnings((prev) => {
-      if (prev.some((w) => w.type === 'video_loading')) return prev;
-      return [...prev, { type: 'video_loading', level: 'warning', message: '视频还未加载完，请稍候再播放' }];
-    });
-  }, [hasNativeVideos, videoSegments.length, allVideosReady]);
+  }, [cameraKeys, episode, hasNativeVideos, selectedEpisodeId, processPreloadQueue]);
 
   useEffect(() => {
     if (!episode || hasNativeVideos) return;
+    preloadQueueRef.current = [];
+    preloadActiveRef.current = 0;
     for (let offset = 0; offset <= PRELOAD_AHEAD; offset += 1) {
       const target = frameId + offset;
       if (target < frameCount) preloadFrame(target);
@@ -290,7 +322,6 @@ export default function App() {
     const interval = 1000 / Math.max(1, fps);
     const tick = (time) => {
       if (hasNativeVideos) {
-        // Find first ready video as master for frame sync
         let master = null;
         let masterSegment = null;
         for (const segment of videoSegments) {
@@ -305,7 +336,6 @@ export default function App() {
           const relative = Math.max(0, master.currentTime - masterSegment.from_timestamp);
           const nextFrame = relativeTimeToFrame(relative);
           setFrameId(nextFrame);
-          // Sync all other videos to master
           for (const segment of videoSegments) {
             const node = videoRefs.current[segment.camera];
             if (!node || node === master || node.readyState < 1) continue;
@@ -379,7 +409,6 @@ export default function App() {
   const handleVideoReady = useCallback((camera) => {
     setVideoReadyMap((prev) => {
       const next = { ...prev, [camera]: true };
-      // Clear video_loading warning when all videos are ready
       const allReady = videoSegments.every((s) => next[s.camera]);
       if (allReady) {
         setWarnings((prev) => prev.filter((w) => w.type !== 'video_loading'));
@@ -397,7 +426,6 @@ export default function App() {
   }, [frameToRelativeTime, videoByCamera]);
 
   const handleVideoWaiting = useCallback((camera) => {
-    // A video stalled - mark it as not ready and show warning
     setVideoReadyMap((prev) => ({ ...prev, [camera]: false }));
     setVideoStalled(true);
   }, []);
@@ -417,6 +445,8 @@ export default function App() {
   }, [frameId, jumpToFrame, togglePlayback]);
 
   const selectedId = useMemo(() => selectedEpisodeId ?? undefined, [selectedEpisodeId]);
+
+  const showChartsEmpty = actions.length === 0 && states.length === 0 && !loadingTrajectories;
 
   return (
     <div className="app-shell">
@@ -443,42 +473,60 @@ export default function App() {
           <button type="button" className="secondary-load-button" onClick={handlePickFolder}>Select Folder</button>
           <button type="submit" disabled={loadingDataset}>{loadingDataset ? 'Loading' : 'Load'}</button>
         </form>
-        <MultiCameraViewer
-          cameraKeys={cameraKeys}
-          frameId={frameId}
-          getSrc={getSrc}
-          videoSegments={videoSegments}
-          videoRefs={videoRefs}
-          onVideoReady={handleVideoReady}
-          onVideoWaiting={handleVideoWaiting}
-        />
-        <Timeline frameId={frameId} frameCount={frameCount} timestamp={timestamp} onChange={jumpToFrame} />
-        {currentTask && <div className="current-task"><span className="task-label">Task</span> {currentTask}</div>}
-        <PlayerControls
-          playing={playing}
-          fps={fps}
-          onToggle={togglePlayback}
-          onPrev={() => jumpToFrame(frameId - 1)}
-          onNext={() => jumpToFrame(frameId + 1)}
-          onFpsChange={setFps}
-        />
-        <div className="trajectory-toolbar">
-          <button type="button" onClick={() => loadEpisodeTrajectories()} disabled={selectedEpisodeId == null || loadingTrajectories}>
-            {loadingTrajectories ? 'Loading trajectories' : 'Load trajectories'}
-          </button>
-        </div>
-        <section className="charts-grid">
-          <ActionChart values={actions} currentFrame={frameId} selectedDim={actionDim} onDimChange={setActionDim} onSelectFrame={jumpToFrame} dimNames={datasetInfo?.action_names} />
-          <StateChart values={states} currentFrame={frameId} selectedDim={stateDim} onDimChange={setStateDim} onSelectFrame={jumpToFrame} dimNames={datasetInfo?.state_names} />
-        </section>
-        <FeatureViewer
-          episodeId={selectedEpisodeId}
-          featureKeys={datasetInfo?.feature_keys}
-          frameId={frameId}
-          onSelectFrame={jumpToFrame}
-        />
+        {episode == null ? (
+          <div className="empty-state">
+            {selectedEpisodeId == null ? 'Select an episode to begin' : episodeLoading ? <><span className="spinner" /> Loading episode...</> : 'Select an episode to begin'}
+          </div>
+        ) : (
+          <>
+            <MultiCameraViewer
+              cameraKeys={cameraKeys}
+              frameId={frameId}
+              getSrc={getSrc}
+              videoSegments={videoSegments}
+              videoRefs={videoRefs}
+              onVideoReady={handleVideoReady}
+              onVideoWaiting={handleVideoWaiting}
+            />
+            <Timeline frameId={frameId} frameCount={frameCount} timestamp={timestamp} onChange={jumpToFrame} />
+            {currentTask && <div className="current-task"><span className="task-label">Task</span> {currentTask}</div>}
+            <PlayerControls
+              playing={playing}
+              fps={fps}
+              onToggle={togglePlayback}
+              onPrev={() => jumpToFrame(frameId - 1)}
+              onNext={() => jumpToFrame(frameId + 1)}
+              onFpsChange={setFps}
+            />
+            <div className="trajectory-toolbar">
+              {loadingTrajectories && <span className="trajectory-status">Loading...</span>}
+              {trajectoriesLoaded && !loadingTrajectories && (
+                <button type="button" onClick={() => loadEpisodeTrajectories()} className="reload-button">Reload</button>
+              )}
+            </div>
+          </>
+        )}
+        {showChartsEmpty ? (
+          <div className="empty-state">{loadingTrajectories ? 'Loading trajectories...' : ''}</div>
+        ) : (
+          <>
+            <TrajectoryChart
+              actions={actions}
+              states={states}
+              actionNames={datasetInfo?.action_names}
+              stateNames={datasetInfo?.state_names}
+              currentFrame={frameId}
+              onSelectFrame={jumpToFrame}
+            />            <FeatureViewer
+              episodeId={selectedEpisodeId}
+              featureKeys={datasetInfo?.feature_keys}
+              frameId={frameId}
+              onSelectFrame={jumpToFrame}
+            />
+          </>
+        )}
       </main>
-      <DatasetInfoPanel datasetInfo={datasetInfo} episode={episode} warnings={warnings} />
+      <DatasetInfoPanel datasetInfo={datasetInfo} episode={episode} warnings={warnings} onNavigateToFrame={navigateToFrame} />
     </div>
   );
 }

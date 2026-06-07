@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from ..config import get_settings
 from ..dataset_loader import DatasetError, get_loader, load_dataset_from_path
 from ..schemas import (
+    AnalysisReport,
     DatasetInfo,
     DatasetLoadRequest,
     DirectoryBrowseResponse,
@@ -153,6 +154,14 @@ def scan_datasets(
             continue
 
     return ScanResult(paths=sorted(found))
+
+
+@router.get("/analysis", response_model=AnalysisReport)
+def analyze_dataset() -> AnalysisReport:
+    try:
+        return get_loader().analyze()
+    except DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/pick-folder", response_model=NativePickResponse)

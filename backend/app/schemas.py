@@ -102,3 +102,23 @@ class TrajectoryResponse(BaseModel):
     states: list
     timestamps: list
     warnings: list[WarningItem]
+
+
+class AnalysisIssue(BaseModel):
+    type: str
+    message: str
+
+
+class AnalysisReport(BaseModel):
+    total_episodes: int
+    total_frames: int
+    total_duration: float
+    nominal_fps: float | None = None
+    actual_fps: float | None = None
+    active_joints: list[str] = []
+    inactive_joints: list[str] = []
+    action_jumps: list[dict] = []
+    fps_deviations: list[dict] = []
+    frame_gaps: list[dict] = []
+    issues: list[AnalysisIssue] = []
+    summary: str = ""
